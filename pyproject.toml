@@ -15,7 +15,6 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
-async = ["nest_asyncio>=1.5"]
 dev = ["pytest>=7.0", "build", "twine"]
 
 [project.scripts]

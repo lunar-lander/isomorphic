@@ -19,17 +19,9 @@ Invocations call the route handler **in-process** -- no HTTP server needed.
 pip install -e .
 ```
 
-For use inside Jupyter notebooks or other async environments with a running
-event loop, install the optional `async` extra for better coroutine handling:
-
-```bash
-pip install -e ".[async]"
-```
-
-This installs [`nest_asyncio`](https://github.com/erdewit/nest_asyncio),
-which allows awaiting coroutines within an already-running loop. Without it,
-a thread-based fallback is used (with `contextvars` propagation), but
-`nest_asyncio` is recommended for async hosts.
+Works inside Jupyter notebooks and other async environments with a running
+event loop — async endpoints are dispatched on a dedicated thread with
+`contextvars` propagation, so no extra dependencies are needed.
 
 ## Use
 

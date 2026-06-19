@@ -42,37 +42,30 @@ def _run_coroutine(coro: Any) -> Any:
     """Await a coroutine, handling both no-loop and running-loop scenarios.
 
     ``asyncio.run`` raises if a loop is already running (e.g. inside Jupyter
-    or an async host app). In that case we use ``nest_asyncio`` if available,
-    or fall back to running on a separate thread with its own loop. The
-    thread fallback copies the current context so ``contextvars`` propagate
-    (important for FastAPI request-scoped state, database sessions, etc.).
+    or an async host app). In that case we run the coroutine on a dedicated
+    thread with its own event loop, copying the current ``contextvars``
+    context so request-scoped state, database sessions, etc. propagate.
     """
     try:
-        loop = asyncio.get_running_loop()
+        asyncio.get_running_loop()
     except RuntimeError:
         return asyncio.run(coro)
     # A loop is already running — can't use asyncio.run.
-    # Try nest_asyncio, else run in a dedicated thread with context copy.
-    try:
-        import nest_asyncio  # type: ignore[import-untyped]
+    # Run in a dedicated thread with context copy.
+    import concurrent.futures
+    import contextvars
 
-        nest_asyncio.apply(loop)
-        return loop.run_until_complete(coro)
-    except ImportError:
-        import concurrent.futures
-        import contextvars
+    ctx = contextvars.copy_context()
 
-        ctx = contextvars.copy_context()
+    def _run() -> Any:
+        new_loop = asyncio.new_event_loop()
+        try:
+            return ctx.run(new_loop.run_until_complete, coro)
+        finally:
+            new_loop.close()
 
-        def _run() -> Any:
-            new_loop = asyncio.new_event_loop()
-            try:
-                return ctx.run(new_loop.run_until_complete, coro)
-            finally:
-                new_loop.close()
-
-        with concurrent.futures.ThreadPoolExecutor(max_workers=1) as pool:
-            return pool.submit(_run).result()
+    with concurrent.futures.ThreadPoolExecutor(max_workers=1) as pool:
+        return pool.submit(_run).result()
 
 
 def _make_command(route: ResolvedRoute, app_label: str) -> Callable[..., Any]:

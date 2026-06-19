@@ -85,7 +85,12 @@ def _flatten_model(
         if default is PydanticUndefined or default is inspect.Parameter.empty:
             default = None
         field_required = finfo.is_required()
+        # Only use simple string aliases. AliasPath and AliasChoices are
+        # complex alias types that can't be used as CLI flag names or dict
+        # keys; fall back to the field name for those.
         alias = finfo.alias or finfo.serialization_alias or finfo.validation_alias
+        if not isinstance(alias, str):
+            alias = None
         wire_key = alias if alias and alias != fname else fname
         # prefix every body field with the model kwarg name to avoid collisions
         # between multiple body models that share field names
@@ -197,7 +202,10 @@ def _has_unresolvable_dependencies(route: APIRoute) -> bool:
         if val:
             all_resolvable.add(val)
     sig = inspect.signature(route.endpoint)
-    for pname in sig.parameters:
+    for pname, param in sig.parameters.items():
+        # *args and **kwargs are not Depends(); skip them.
+        if param.kind in (inspect.Parameter.VAR_POSITIONAL, inspect.Parameter.VAR_KEYWORD):
+            continue
         if pname in all_resolvable or pname in _SAFE_INJECTED_PARAM_NAMES:
             continue
         # This param is in the signature but not resolvable -> it's a Depends()
@@ -297,19 +305,20 @@ def resolve_route(route: APIRoute) -> Optional[ResolvedRoute]:
             # model_validate expects the model's own fields.
             _flatten_model(annotation, pname, pname, (), params, optional_parent=False)
         else:
-            lst = is_list(annotation)
-            inner = list_inner(annotation) if lst else annotation
+            # Non-Pydantic body (dict, list[int], raw scalar). Treated as a
+            # single CLI param that accepts a JSON string. model_name is None
+            # so the invoker maps it 1:1 as a kwarg (no body_models entry,
+            # no wire_path nesting).
             params.append(
                 Param(
                     name=pname,
                     cli_name=_snake(pname),
                     kind=ParamKind.BODY_FIELD,
-                    annotation=inner if lst else annotation,
+                    annotation=annotation,
                     required=True,
                     default=None,
-                    model_name=pname,
-                    is_list=lst,
-                    wire_path=(),
+                    model_name=None,
+                    is_list=False,
                 )
             )
 

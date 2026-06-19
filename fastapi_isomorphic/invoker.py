@@ -11,6 +11,20 @@ from pydantic import BaseModel, TypeAdapter
 from .models import Param, ParamKind, ResolvedRoute
 from .utils import unwrap_optional
 
+# Cache TypeAdapter instances to avoid re-building the validation schema on
+# every call to _coerce.  Keyed by id(annotation) since not all annotations
+# are hashable (e.g. generic aliases).
+_TA_CACHE: Dict[int, TypeAdapter] = {}
+
+
+def _get_type_adapter(annotation: Any) -> TypeAdapter:
+    key = id(annotation)
+    ta = _TA_CACHE.get(key)
+    if ta is None:
+        ta = TypeAdapter(annotation)
+        _TA_CACHE[key] = ta
+    return ta
+
 
 def _coerce(value: Any, annotation: Any) -> Any:
     """Coerce a raw string (from argv) to the param's python type.
@@ -28,18 +42,22 @@ def _coerce(value: Any, annotation: Any) -> Any:
     origin = typing.get_origin(annotation)
     args = typing.get_args(annotation)
     inner = args[0] if args else None
-    is_model = (
-        isinstance(annotation, type) and issubclass(annotation, BaseModel)
+    # Pre-parse JSON strings for types that expect structured data (dicts,
+    # lists, BaseModels). TypeAdapter won't auto-parse a raw JSON string
+    # into these types.
+    needs_json = (
+        isinstance(annotation, type) and issubclass(annotation, (BaseModel, dict))
     ) or (
-        origin in (list, List, typing.List)  # type: ignore[comparison-overlap]
-        and isinstance(inner, type) and issubclass(inner, BaseModel)
+        origin in (list, List, typing.List, dict)  # type: ignore[comparison-overlap]
+    ) or (
+        annotation in (dict, list)
     )
-    if is_model and isinstance(value, str):
+    if needs_json and isinstance(value, str):
         try:
             value = json.loads(value)
         except (json.JSONDecodeError, TypeError):
             pass
-    ta = TypeAdapter(annotation)
+    ta = _get_type_adapter(annotation)
     return ta.validate_python(value)
 
 

@@ -571,12 +571,11 @@ def test_run_coroutine_no_running_loop():
 
 
 def test_run_coroutine_with_running_loop():
-    """_run_coroutine handles a running event loop via fallback."""
+    """_run_coroutine dispatches to thread when a loop is already running."""
     import asyncio
     from fastapi_isomorphic.cli import _run_coroutine
 
     async def inner():
-        # This coroutine is awaited from within a running loop
         async def coro():
             await asyncio.sleep(0)
             return 99
@@ -603,3 +602,147 @@ def test_run_coroutine_thread_fallback_propagates_context():
 
     result = asyncio.run(inner())
     assert result == "from-caller"
+
+
+# --- non-Pydantic body params ---
+
+def test_non_pydantic_body_dict(runner):
+    """A route with a raw dict body param should accept JSON via CLI."""
+    a = _FA()
+
+    @a.post("/upload")
+    async def upload(payload: dict):
+        return {"received": payload}
+
+    cli = FastAPICLI(a, label="raw")
+    result = runner.invoke(
+        cli.typer_app,
+        ["post", "upload", "--payload", '{"key": "value", "n": 42}'],
+    )
+    assert result.exit_code == 0, result.stdout
+    out = _json(result)
+    assert out["received"] == {"key": "value", "n": 42}
+
+
+def test_non_pydantic_body_list(runner):
+    """A route with a raw list body param should accept JSON via CLI."""
+    a = _FA()
+
+    @a.post("/ids")
+    async def process(data: list):
+        return {"count": len(data), "data": data}
+
+    cli = FastAPICLI(a, label="rawlist")
+    result = runner.invoke(
+        cli.typer_app,
+        ["post", "ids", "--data", '[1, 2, 3]'],
+    )
+    assert result.exit_code == 0, result.stdout
+    out = _json(result)
+    assert out["count"] == 3
+    assert out["data"] == [1, 2, 3]
+
+
+# --- main() entrypoint ---
+
+def test_main_missing_args_exits_2():
+    """main() with no args should exit with code 2."""
+    from unittest.mock import patch
+    from fastapi_isomorphic.core import main
+
+    with patch("sys.argv", ["fastapi-isomorphic"]):
+        with pytest.raises(SystemExit) as exc_info:
+            main()
+        assert exc_info.value.code == 2
+
+
+def test_main_with_valid_app(tmp_path, monkeypatch):
+    """main() should load the app and dispatch the CLI."""
+    pkg = tmp_path / "mainpkg"
+    pkg.mkdir()
+    (pkg / "__init__.py").write_text("")
+    (pkg / "app.py").write_text(
+        "from fastapi import FastAPI\n"
+        "app = FastAPI()\n"
+        "@app.get('/health')\n"
+        "async def health():\n"
+        "    return {'status': 'ok'}\n"
+    )
+    monkeypatch.syspath_prepend(str(tmp_path))
+    from unittest.mock import patch
+    from fastapi_isomorphic.core import main
+    import io
+
+    with patch("sys.argv", ["fastapi-isomorphic", "mainpkg.app:app", "get", "health"]):
+        # Capture typer output
+        from typer.testing import CliRunner as _CR
+        # main() calls cli.run() which uses sys.argv — we need to intercept output
+        # Instead, verify it doesn't crash (output goes to stdout)
+        main()  # should not raise
+
+
+# --- AliasPath / AliasChoices handling ---
+
+def test_alias_path_field_uses_field_name():
+    """Fields with AliasPath should fall back to field name, not crash."""
+    a = _FA()
+
+    @a.post("/config")
+    async def update_config(cfg: _AliasPathConfig):
+        return cfg.model_dump()
+
+    cli = FastAPICLI(a, label="alias")
+    post = next(r for r in cli.routes if r.group == "post")
+    # Should use field name "setting" as cli flag, not the AliasPath object
+    body_fields = [p for p in post.params if p.kind == ParamKind.BODY_FIELD]
+    cli_names = {p.cli_name for p in body_fields}
+    # Should be a string-based name, not crash
+    assert any("setting" in n for n in cli_names)
+
+
+def test_alias_choices_field_uses_field_name():
+    """Fields with AliasChoices should fall back to field name, not crash."""
+    a = _FA()
+
+    @a.post("/opts")
+    async def set_opts(opts: _AliasChoicesOpts):
+        return opts.model_dump()
+
+    cli = FastAPICLI(a, label="choices")
+    post = next(r for r in cli.routes if r.group == "post")
+    body_fields = [p for p in post.params if p.kind == ParamKind.BODY_FIELD]
+    cli_names = {p.cli_name for p in body_fields}
+    assert any("value" in n for n in cli_names)
+
+
+# --- AliasPath / AliasChoices models (module-level for annotation resolution) ---
+
+from pydantic import AliasPath as _AliasPath, AliasChoices as _AliasChoices
+
+
+class _AliasPathConfig(_BM):
+    setting: str = _Field(default="x", validation_alias=_AliasPath("nested", "setting"))
+
+
+class _AliasChoicesOpts(_BM):
+    value: int = _Field(default=0, validation_alias=_AliasChoices("val", "v"))
+
+
+# --- *args / **kwargs routes ---
+
+def test_kwargs_route_is_not_skipped():
+    """Routes with **kwargs should not be incorrectly flagged as Depends()."""
+    import warnings
+
+    a = _FA()
+
+    @a.get("/echo/{x}")
+    async def echo(x: int, **kwargs):
+        return {"x": x}
+
+    with warnings.catch_warnings(record=True) as w:
+        warnings.simplefilter("always")
+        cli = FastAPICLI(a, label="kw")
+    # Should NOT be skipped with a Depends warning
+    assert not any("Depends" in str(wi.message) for wi in w)
+    assert len(cli.routes) == 1
