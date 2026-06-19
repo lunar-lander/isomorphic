@@ -43,14 +43,16 @@ def _run_coroutine(coro: Any) -> Any:
 
     ``asyncio.run`` raises if a loop is already running (e.g. inside Jupyter
     or an async host app). In that case we use ``nest_asyncio`` if available,
-    or fall back to running on a separate thread with its own loop.
+    or fall back to running on a separate thread with its own loop. The
+    thread fallback copies the current context so ``contextvars`` propagate
+    (important for FastAPI request-scoped state, database sessions, etc.).
     """
     try:
         loop = asyncio.get_running_loop()
     except RuntimeError:
         return asyncio.run(coro)
     # A loop is already running — can't use asyncio.run.
-    # Try nest_asyncio, else run in a dedicated thread.
+    # Try nest_asyncio, else run in a dedicated thread with context copy.
     try:
         import nest_asyncio  # type: ignore[import-untyped]
 
@@ -58,11 +60,14 @@ def _run_coroutine(coro: Any) -> Any:
         return loop.run_until_complete(coro)
     except ImportError:
         import concurrent.futures
+        import contextvars
+
+        ctx = contextvars.copy_context()
 
         def _run() -> Any:
             new_loop = asyncio.new_event_loop()
             try:
-                return new_loop.run_until_complete(coro)
+                return ctx.run(new_loop.run_until_complete, coro)
             finally:
                 new_loop.close()
 
@@ -96,21 +101,23 @@ def _make_command(route: ResolvedRoute, app_label: str) -> Callable[..., Any]:
             )
         else:
             if p.kind == ParamKind.BODY_FIELD:
-                # Show the actual pydantic default in --help, but use None as
-                # the sentinel so the rebuilder can omit unsupplied fields
-                # and let pydantic apply its own defaults.
+                # Body fields use None as the CLI sentinel so the rebuilder
+                # can omit unsupplied fields. Show the actual pydantic default
+                # in the help text and suppress Typer's own (None) default.
                 if p.required:
                     default_val = ...
                 else:
                     default_val = None
+                show_default = False
             else:
                 default_val = ... if p.required else p.default
+                show_default = True
             help_text = f"{p.kind.value}: {p.name}" + (
                 f" (body field of {p.model_name})" if p.model_name else ""
             )
             if p.kind == ParamKind.BODY_FIELD and not p.required and p.default is not None:
                 help_text += f" [default: {p.default}]"
-            opt = typer.Option(default_val, f"--{p.cli_name}", help=help_text)
+            opt = typer.Option(default_val, f"--{p.cli_name}", help=help_text, show_default=show_default)
             sig_params.append(
                 inspect.Parameter(p.name, inspect.Parameter.KEYWORD_ONLY, default=opt, annotation=annotation)
             )

@@ -361,8 +361,8 @@ def test_same_url_get_vs_put_both_run(runner, nested_cli):
 
 # --- Depends() handling ---
 
-def test_depends_route_is_skipped_with_warning():
-    """Routes with Depends() should be skipped, not crash at invocation."""
+def test_depends_function_param_is_skipped_with_warning():
+    """Routes with Depends() as function params should be skipped, not crash."""
     import warnings
     from fastapi import Depends
 
@@ -380,6 +380,28 @@ def test_depends_route_is_skipped_with_warning():
         cli = FastAPICLI(a, label="dep")
     assert any("Depends" in str(wi.message) for wi in w)
     assert len(cli.routes) == 0  # the route was skipped
+
+
+def test_route_level_depends_is_not_skipped():
+    """Route-level dependencies=[Depends(...)] are safe for CLI — not skipped."""
+    import warnings
+    from fastapi import Depends
+
+    def verify_token():
+        return "ok"
+
+    a = _FA(title="RouteDep")
+
+    @a.get("/secure/{x}", dependencies=[Depends(verify_token)])
+    async def secure(x: int):
+        return {"x": x}
+
+    with warnings.catch_warnings(record=True) as w:
+        warnings.simplefilter("always")
+        cli = FastAPICLI(a, label="rdep")
+    # no Depends warning — route-level deps don't affect the function signature
+    assert not any("Depends" in str(wi.message) for wi in w)
+    assert len(cli.routes) == 1  # route was NOT skipped
 
 
 # --- enum body fields ---
@@ -532,3 +554,52 @@ def test_multi_method_api_route_warns():
     assert any("multiple methods" in str(wi.message) for wi in w)
     assert len(cli.routes) == 1
     assert cli.routes[0].group == "get"  # alphabetically first
+
+
+# --- async loop fallback ---
+
+def test_run_coroutine_no_running_loop():
+    """_run_coroutine works when no event loop is running (normal CLI)."""
+    import asyncio
+    from fastapi_isomorphic.cli import _run_coroutine
+
+    async def coro():
+        await asyncio.sleep(0)
+        return 42
+
+    assert _run_coroutine(coro()) == 42
+
+
+def test_run_coroutine_with_running_loop():
+    """_run_coroutine handles a running event loop via fallback."""
+    import asyncio
+    from fastapi_isomorphic.cli import _run_coroutine
+
+    async def inner():
+        # This coroutine is awaited from within a running loop
+        async def coro():
+            await asyncio.sleep(0)
+            return 99
+        return _run_coroutine(coro())
+
+    result = asyncio.run(inner())
+    assert result == 99
+
+
+def test_run_coroutine_thread_fallback_propagates_context():
+    """Thread fallback should propagate contextvars."""
+    import asyncio
+    import contextvars
+    from fastapi_isomorphic.cli import _run_coroutine
+
+    var = contextvars.ContextVar("test_var", default="unset")
+    var.set("from-caller")
+
+    async def coro():
+        return var.get()
+
+    async def inner():
+        return _run_coroutine(coro())
+
+    result = asyncio.run(inner())
+    assert result == "from-caller"

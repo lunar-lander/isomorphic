@@ -139,7 +139,13 @@ def _flatten_model(
 
 
 def _check_uniqueness(params: List[Param], path: str) -> None:
-    """Raise if two params share the same ``cli_name`` (silent data loss)."""
+    """Raise if two non-path params share the same ``cli_name``.
+
+    Path params are positional (no flag) so they're excluded. This check
+    prevents silent data loss when two options would map to the same
+    ``--flag``. Path param name collisions are not checked here — FastAPI
+    itself rejects duplicate path param names at route definition time.
+    """
     seen: dict[str, str] = {}
     for p in params:
         if p.kind == ParamKind.PATH:
@@ -153,19 +159,50 @@ def _check_uniqueness(params: List[Param], path: str) -> None:
         seen[p.cli_name] = p.name
 
 
-def _has_unresolvable_dependencies(route: APIRoute) -> bool:
-    """True if the endpoint has Depends() params we can't satisfy via CLI.
+# FastAPI injects these as named attributes on the Dependant rather than
+# in the path/query/header/cookie/body param lists. They have real defaults
+# or are framework-internal, so they're safe to omit when calling the raw
+# endpoint function directly.
+_SAFE_INJECTED_PARAM_NAMES = frozenset({
+    "request", "response", "background_tasks", "scope",
+    "http_connection", "websocket", "security_scopes",
+})
 
-    FastAPI's ``dependant.dependencies`` are sub-dependencies. Any endpoint
-    param that comes from ``Depends(...)`` (rather than path/query/header/
-    cookie/body) would receive ``None`` when called as a raw function,
-    causing a TypeError. We detect this by comparing the endpoint's actual
-    signature params against the resolvable param sets.
+
+def _has_unresolvable_dependencies(route: APIRoute) -> bool:
+    """True if the endpoint has Depends() *function params* we can't satisfy.
+
+    FastAPI stores both route-level dependencies (``dependencies=[...]``)
+    and function-parameter dependencies (``db=Depends(get_db)``) in
+    ``dependant.dependencies``. Route-level deps don't appear in the
+    endpoint signature, so they're safe for CLI invocation. Function-param
+    deps appear in the signature but NOT in any dependant param list
+    (path/query/header/cookie/body) — calling the raw function would raise
+    ``TypeError: missing argument``.
+
+    We detect the dangerous case by comparing the endpoint's signature
+    parameters against the union of all resolvable param names. Any sig
+    param not found there (and not a known framework-injected name) is a
+    Depends() function param.
     """
     d = route.dependant
-    # FastAPI stashes special injected params (request, response, etc.) in
-    # named attributes; anything in dependant.dependencies is a Depends().
-    return bool(d.dependencies)
+    all_resolvable = set()
+    for attr in ("path_params", "query_params", "header_params", "cookie_params", "body_params"):
+        for p in getattr(d, attr):
+            all_resolvable.add(p.name)
+    # add framework-injected names that FastAPI handles via named attributes
+    for attr in ("request_param_name", "response_param_name", "background_tasks_param_name",
+                 "websocket_param_name", "http_connection_param_name", "security_scopes_param_name"):
+        val = getattr(d, attr, None)
+        if val:
+            all_resolvable.add(val)
+    sig = inspect.signature(route.endpoint)
+    for pname in sig.parameters:
+        if pname in all_resolvable or pname in _SAFE_INJECTED_PARAM_NAMES:
+            continue
+        # This param is in the signature but not resolvable -> it's a Depends()
+        return True
+    return False
 
 
 def resolve_route(route: APIRoute) -> Optional[ResolvedRoute]:
@@ -255,7 +292,10 @@ def resolve_route(route: APIRoute) -> Optional[ResolvedRoute]:
         annotation = unwrap_optional(annotation)
         if isinstance(annotation, type) and issubclass(annotation, BaseModel):
             body_models.append(pname)
-            _flatten_model(annotation, pname, pname, (pname,), params, optional_parent=False)
+            # prefix name/cli_name with the model kwarg for collision avoidance,
+            # but keep wire_path as the pure field path (no model name) since
+            # model_validate expects the model's own fields.
+            _flatten_model(annotation, pname, pname, (), params, optional_parent=False)
         else:
             lst = is_list(annotation)
             inner = list_inner(annotation) if lst else annotation
@@ -269,7 +309,7 @@ def resolve_route(route: APIRoute) -> Optional[ResolvedRoute]:
                     default=None,
                     model_name=pname,
                     is_list=lst,
-                    wire_path=(pname,),
+                    wire_path=(),
                 )
             )
 

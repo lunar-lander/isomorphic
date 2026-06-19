@@ -61,10 +61,9 @@ def rebuild_args(route: ResolvedRoute, raw: Dict[str, Any]) -> Dict[str, Any]:
     applies the model's own defaults. Nested optional models whose sub-fields
     are all omitted simply won't appear in the dict, yielding ``None``.
 
-    The ``wire_path`` tuple's first element is the model kwarg name (e.g.
-    ``item``); we strip it when building the model's field dict, since
-    ``model_validate`` expects the model's own fields, not the endpoint's
-    kwarg name.
+    ``wire_path`` is the pure field path within the model (e.g.
+    ``("address", "street")``), NOT including the model kwarg name. The
+    model name is tracked separately via ``Param.model_name``.
     """
     kwargs: Dict[str, Any] = {}
     body_buckets: Dict[str, dict] = {m: {} for m in route.body_models}
@@ -80,9 +79,7 @@ def rebuild_args(route: ResolvedRoute, raw: Dict[str, Any]) -> Dict[str, Any]:
         if v is None:
             continue
         coerced = _coerce(v, p.annotation)
-        # wire_path[0] is the model kwarg name; strip it for model_validate
-        field_path = p.wire_path[1:] if p.wire_path and p.wire_path[0] == p.model_name else p.wire_path
-        _set_nested(body_buckets[p.model_name], field_path, coerced)
+        _set_nested(body_buckets[p.model_name], p.wire_path, coerced)
 
     hints = typing.get_type_hints(route.endpoint, include_extras=True)
     for mname in route.body_models:
