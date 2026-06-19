@@ -20,3 +20,6 @@ fastapi-isomorphic = "fastapi_isomorphic.core:main"
 [tool.setuptools.packages.find]
 where = ["."]
 include = ["fastapi_isomorphic*"]
+
+[tool.setuptools.package-data]
+fastapi_isomorphic = ["py.typed"]

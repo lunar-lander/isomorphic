@@ -29,7 +29,6 @@ def _typer_annotation(p: Param) -> Any:
     if ann in _SCALARS:
         return ann
     if p.is_list:
-        # list of scalar -> let Typer collect repeats; list of complex -> str (JSON)
         origin = typing.get_origin(ann)
         if origin in (list, List, typing.List):  # type: ignore[comparison-overlap]
             inner = typing.get_args(ann)[0]
@@ -37,6 +36,38 @@ def _typer_annotation(p: Param) -> Any:
                 return List[inner]  # type: ignore[valid-type]
         return str
     return str
+
+
+def _run_coroutine(coro: Any) -> Any:
+    """Await a coroutine, handling both no-loop and running-loop scenarios.
+
+    ``asyncio.run`` raises if a loop is already running (e.g. inside Jupyter
+    or an async host app). In that case we use ``nest_asyncio`` if available,
+    or fall back to running on a separate thread with its own loop.
+    """
+    try:
+        loop = asyncio.get_running_loop()
+    except RuntimeError:
+        return asyncio.run(coro)
+    # A loop is already running — can't use asyncio.run.
+    # Try nest_asyncio, else run in a dedicated thread.
+    try:
+        import nest_asyncio  # type: ignore[import-untyped]
+
+        nest_asyncio.apply(loop)
+        return loop.run_until_complete(coro)
+    except ImportError:
+        import concurrent.futures
+
+        def _run() -> Any:
+            new_loop = asyncio.new_event_loop()
+            try:
+                return new_loop.run_until_complete(coro)
+            finally:
+                new_loop.close()
+
+        with concurrent.futures.ThreadPoolExecutor(max_workers=1) as pool:
+            return pool.submit(_run).result()
 
 
 def _make_command(route: ResolvedRoute, app_label: str) -> Callable[..., Any]:
@@ -47,7 +78,7 @@ def _make_command(route: ResolvedRoute, app_label: str) -> Callable[..., Any]:
     params become positional ``typer.Argument``s; query/header/cookie and
     flattened body fields become ``typer.Option`` flags. The body gathers
     all values, calls :func:`rebuild_args`, and invokes the endpoint
-    in-process (async endpoints are awaited via ``asyncio.run``).
+    in-process (async endpoints are awaited safely).
     """
     sig_params: List[inspect.Parameter] = []
     annotations: Dict[str, Any] = {}
@@ -64,15 +95,21 @@ def _make_command(route: ResolvedRoute, app_label: str) -> Callable[..., Any]:
                 inspect.Parameter(p.name, inspect.Parameter.POSITIONAL_OR_KEYWORD, default=decl, annotation=annotation)
             )
         else:
-            # body fields: always default to None on the CLI side so the
-            # rebuilder can omit them and let pydantic apply model defaults.
             if p.kind == ParamKind.BODY_FIELD:
-                default_val = ... if p.required else None
+                # Show the actual pydantic default in --help, but use None as
+                # the sentinel so the rebuilder can omit unsupplied fields
+                # and let pydantic apply its own defaults.
+                if p.required:
+                    default_val = ...
+                else:
+                    default_val = None
             else:
                 default_val = ... if p.required else p.default
             help_text = f"{p.kind.value}: {p.name}" + (
                 f" (body field of {p.model_name})" if p.model_name else ""
             )
+            if p.kind == ParamKind.BODY_FIELD and not p.required and p.default is not None:
+                help_text += f" [default: {p.default}]"
             opt = typer.Option(default_val, f"--{p.cli_name}", help=help_text)
             sig_params.append(
                 inspect.Parameter(p.name, inspect.Parameter.KEYWORD_ONLY, default=opt, annotation=annotation)
@@ -86,7 +123,7 @@ def _make_command(route: ResolvedRoute, app_label: str) -> Callable[..., Any]:
         rebuilt = rebuild_args(route, raw)
         result = route.endpoint(**rebuilt)
         if inspect.iscoroutine(result):
-            result = asyncio.run(result)
+            result = _run_coroutine(result)
         if hasattr(result, "model_dump"):
             out = result.model_dump(by_alias=True, mode="json")
         elif isinstance(result, (dict, list, str, int, float, bool)) or result is None:

@@ -57,23 +57,47 @@ fastapi-isomorphic my_package.my_module:app get items-item-id 7 --limit 5
 | Query param `q` / `limit`      | `--q`, `--limit` (type and default kept)                |
 | Header param `x_token` (alias `x-token`) | `--x-token`                          |
 | Cookie param                  | `--cookie-name`                                        |
-| Body `item: Item` (pydantic)  | flattened to `--name`, `--price-alias`, `--tags` ...   |
+| Body `item: Item` (pydantic)  | flattened to `--item.name`, `--item.price-alias`, `--item.tags` ...   |
 | Body `item: Item` with nested model | recursively flattened to dotted flags: `--item.address.street`, `--item.address.zip` |
 
 Body models are **recursively flattened** with `.` as the nesting delimiter.
-Each pydantic field — at any depth — becomes its own dotted flag, so
-`POST /users/{uid}` with body `User{name, profile: Profile{nickname, settings: Settings{theme, lang}}}`
+Each pydantic field — at any depth — becomes its own dotted flag, prefixed
+by the body model's kwarg name to avoid collisions between multiple body
+models. So `POST /users/{uid}` with body `User{name, profile: Profile{nickname, settings: Settings{theme, lang}}}`
 is invoked as:
 
 ```bash
-post users-uid 3 --name Ada --profile.nickname dee --profile.settings.theme dark --profile.settings.lang fr
+post users-uid 3 \
+  --user.name Ada \
+  --user.profile.nickname dee \
+  --user.profile.settings.theme dark \
+  --user.profile.settings.lang fr
 ```
 
-Repeated `--tags` produce a list. Optional fields can be omitted; pydantic
-fills in their defaults. Optional nested models (`Address | None`) whose
-sub-fields are all omitted resolve to `None`. `list[BaseModel]` fields are
-kept as a single JSON-accepting flag (e.g. `--items '[{...}]'`) since a list
-of complex objects cannot be meaningfully flattened into scalar flags.
+When two body models share field names (e.g. `author: Author{name}` and
+`book: Book{name}`), the model prefix disambiguates: `--author.name` vs
+`--book.name`.
+
+Repeated `--item.tags` produce a list. Optional fields can be omitted;
+pydantic fills in their defaults. Optional nested models (`Address | None`)
+whose sub-fields are all omitted resolve to `None`. `list[BaseModel]` fields
+are kept as a single JSON-accepting flag (e.g. `--item.children '[{...}]'`)
+since a list of complex objects cannot be meaningfully flattened into scalar
+flags.
+
+### Routes with `Depends()`
+
+Endpoints that use `Depends()` for sub-dependencies (auth, DB sessions,
+pagination, etc.) **cannot be invoked via CLI** — the raw function call
+would crash with a missing-argument `TypeError`. Such routes are
+**skipped at resolution time** with a warning. Call them via HTTP instead.
+
+### Multi-method routes (`@app.api_route`)
+
+A single route registered with multiple methods (e.g.
+`@app.api_route("/x", methods=["GET", "POST"])`) generates **one command**
+under the alphabetically-first method group, with a warning. This is
+inherently ambiguous; prefer separate `@app.get` / `@app.post` decorators.
 
 ## Output
 
@@ -90,11 +114,12 @@ Prints every route with its method, path, flattened params, and types.
 
 ## Limitations / scope
 
-- `Depends(...)` sub-dependencies are *not* flattened yet; only direct
-  path/query/header/cookie/body params of the endpoint are mirrored. (The
-  endpoint still receives its `Depends`-resolved values only when run as an
-  API; under CLI we call the raw function, so `Depends` params must not be
-  on the mirrored endpoint. This is the same trade-off Typer would make.)
+- `Depends(...)` sub-dependencies cannot be resolved in a CLI context.
+  Routes using `Depends()` are **skipped with a warning** at resolve time,
+  not crashed at invocation. Call them via HTTP.
 - File uploads (`UploadFile` / `File(...)`) are not mapped to flags; pass
   them as raw values via the body.
 - WebSocket routes are ignored.
+- `str | int`-style unions validate as `str` (the raw CLI string) since
+  pydantic matches `str` first. Use `list[BaseModel]` JSON flags if you
+  need exact type control.

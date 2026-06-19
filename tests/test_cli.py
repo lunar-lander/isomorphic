@@ -29,24 +29,26 @@ def _load_example_app():
     return mod.app
 
 
-@pytest.fixture(scope="module")
+@pytest.fixture
 def app():
     return _load_example_app()
 
 
-@pytest.fixture(scope="module")
+@pytest.fixture
 def cli(app):
     return FastAPICLI(app, label="demo")
 
 
-@pytest.fixture(scope="module")
+@pytest.fixture
 def runner():
     return CliRunner()
 
 
-def _json(out: str):
+def _json(out):
     return json.loads(out.stdout)
 
+
+# --- demo app tests ---
 
 def test_resolver_counts_routes(app):
     routes = resolve_app(app)
@@ -60,14 +62,11 @@ def test_get_item_params_flattened(cli):
     assert ParamKind.PATH in kinds
     assert ParamKind.QUERY in kinds
     assert ParamKind.HEADER in kinds
-    # path positional
     pid = next(p for p in get.params if p.kind == ParamKind.PATH)
     assert pid.name == "item_id"
     assert pid.required is True
-    # header uses wire alias
     xtok = next(p for p in get.params if p.kind == ParamKind.HEADER)
     assert xtok.cli_name == "x-token"
-    # query default preserved
     lim = next(p for p in get.params if p.name == "limit")
     assert lim.default == 10
     assert lim.required is False
@@ -77,12 +76,11 @@ def test_post_body_is_flattened(cli):
     post = next(r for r in cli.routes if "POST" in r.methods)
     body_fields = [p for p in post.params if p.kind == ParamKind.BODY_FIELD]
     names = {p.name for p in body_fields}
-    assert {"name", "price", "tags", "q"}.issubset(names)
-    # price keeps its alias on the wire side -- the python field name is `price`
-    price = next(p for p in body_fields if p.name == "price")
+    # body fields are prefixed with the model kwarg name to avoid collisions
+    assert {"item_name", "item_price", "item_tags", "filter_q"} == names
+    price = next(p for p in body_fields if p.name == "item_price")
     assert price.model_name == "item"
-    # tags is a list
-    tags = next(p for p in body_fields if p.name == "tags")
+    tags = next(p for p in body_fields if p.name == "item_tags")
     assert tags.is_list is True
 
 
@@ -105,24 +103,23 @@ def test_post_command_rebuilds_body_model(runner, cli):
         cli.typer_app,
         [
             "post", "items-item-id", "3",
-            "--name", "Widget",
-            "--price-alias", "9.99",
-            "--tags", "a",
-            "--tags", "b",
+            "--item.name", "Widget",
+            "--item.price-alias", "9.99",
+            "--item.tags", "a",
+            "--item.tags", "b",
         ],
     )
     assert result.exit_code == 0, result.stdout
     out = _json(result)
     assert out["item_id"] == 3
     assert out["item"] == {"name": "Widget", "priceAlias": 9.99, "tags": ["a", "b"]}
-    # filter falls back to its default model (q="")
-    assert out["filter"] == {"q": ""}
+    assert out["filter"] == {"q": ""}  # filter falls back to default
 
 
 def test_post_command_can_supply_filter_field(runner, cli):
     result = runner.invoke(
         cli.typer_app,
-        ["post", "items-item-id", "3", "--name", "Widget", "--q", "search"],
+        ["post", "items-item-id", "3", "--item.name", "Widget", "--filter.q", "search"],
     )
     assert result.exit_code == 0, result.stdout
     out = _json(result)
@@ -146,6 +143,8 @@ def test_list_command_lists_all_routes(runner, cli):
     assert "delete items-item-id" in cmds
 
 
+# --- from_import / _load_app ---
+
 def test_from_import_loads_app(tmp_path, monkeypatch):
     pkg = tmp_path / "mypkg"
     pkg.mkdir()
@@ -162,6 +161,40 @@ def test_from_import_loads_app(tmp_path, monkeypatch):
     assert any("ping" in r.command_name for r in cli.routes)
 
 
+def test_load_app_rejects_empty_path():
+    from fastapi_isomorphic.core import _load_app
+    with pytest.raises(ValueError, match="empty"):
+        _load_app("")
+
+
+def test_load_app_rejects_missing_module():
+    from fastapi_isomorphic.core import _load_app
+    with pytest.raises(ValueError, match="module name before"):
+        _load_app(":app")
+
+
+def test_load_app_rejects_missing_attr():
+    from fastapi_isomorphic.core import _load_app
+    with pytest.raises(ValueError, match="attribute after"):
+        _load_app("os.path:")
+
+
+def test_load_app_rejects_multiple_colons():
+    from fastapi_isomorphic.core import _load_app
+    with pytest.raises(ValueError, match="multiple ':'"):
+        _load_app("foo:bar:baz")
+
+
+def test_load_app_attribute_error_lists_attrs(tmp_path, monkeypatch):
+    pkg = tmp_path / "badpkg"
+    pkg.mkdir()
+    (pkg / "__init__.py").write_text("x = 1\n")
+    monkeypatch.syspath_prepend(str(tmp_path))
+    from fastapi_isomorphic.core import _load_app
+    with pytest.raises(AttributeError, match="no attribute"):
+        _load_app("badpkg:nonexistent")
+
+
 # --- nested JSON body + same URL different methods ---
 
 from pydantic import BaseModel as _BM, Field as _Field
@@ -176,9 +209,9 @@ class _Address(_BM):
 class _User(_BM):
     name: str
     age: int = 0
-    address: _Address              # nested required model
+    address: _Address
     tags: list[str] = []
-    secondary: _Address | None = None   # nested optional model
+    secondary: _Address | None = None
 
 
 def _build_nested_app() -> _FA:
@@ -224,21 +257,14 @@ def _build_deep_app() -> _FA:
     return a
 
 
-@pytest.fixture(scope="module")
-def nested_app():
-    return _build_nested_app()
-
-
-@pytest.fixture(scope="module")
-def nested_cli(nested_app):
-    return FastAPICLI(nested_app, label="nested")
+@pytest.fixture
+def nested_cli():
+    return FastAPICLI(_build_nested_app(), label="nested")
 
 
 def test_same_url_different_methods_get_distinct_commands(nested_cli):
-    """GET/POST/PUT on /users/{uid} must produce 3 separate commands."""
     groups = {r.group for r in nested_cli.routes}
     assert {"get", "post", "put"} == groups
-    # same command name, different group -> no collision
     cmds = {(r.group, r.command_name) for r in nested_cli.routes}
     assert ("get", "users-uid") in cmds
     assert ("post", "users-uid") in cmds
@@ -246,34 +272,34 @@ def test_same_url_different_methods_get_distinct_commands(nested_cli):
 
 
 def test_nested_body_field_flattened_with_dots(nested_cli):
-    """Nested BaseModel fields are flattened to dotted flags, not JSON blobs."""
+    """Nested BaseModel fields are flattened to dotted flags, prefixed by model name."""
     post = next(r for r in nested_cli.routes if r.group == "post")
     names = {p.name for p in post.params}
-    assert "address_street" in names
-    assert "address_zip" in names
-    assert "secondary_street" in names  # optional nested also flattened
-    assert "secondary_zip" in names
-    # no single 'address' JSON flag — it's been flattened
-    assert "address" not in names
+    assert "user_address_street" in names
+    assert "user_address_zip" in names
+    assert "user_secondary_street" in names
+    assert "user_secondary_zip" in names
+    assert "user_name" in names
+    assert "user_age" in names
 
 
 def test_nested_body_dotted_flags_run(runner, nested_cli):
-    """--address.street / --address.zip build the nested model in-process."""
+    """--user.address.street / --user.address.zip build the nested model in-process."""
     result = runner.invoke(
         nested_cli.typer_app,
         [
             "post", "users-uid", "42",
-            "--name", "Ada",
-            "--age", "30",
-            "--address.street", "1 Main",
-            "--address.zip", "00000",
+            "--user.name", "Ada",
+            "--user.age", "30",
+            "--user.address.street", "1 Main",
+            "--user.address.zip", "00000",
         ],
     )
     assert result.exit_code == 0, result.stdout
     out = _json(result)
     assert out["uid"] == 42
     assert out["user"]["address"] == {"street": "1 Main", "zip": "00000"}
-    assert out["user"]["secondary"] is None  # optional nested omitted
+    assert out["user"]["secondary"] is None
 
 
 def test_nested_body_optional_model_can_be_supplied(runner, nested_cli):
@@ -281,11 +307,11 @@ def test_nested_body_optional_model_can_be_supplied(runner, nested_cli):
         nested_cli.typer_app,
         [
             "post", "users-uid", "1",
-            "--name", "Bob",
-            "--address.street", "X",
-            "--address.zip", "1",
-            "--secondary.street", "Y",
-            "--secondary.zip", "2",
+            "--user.name", "Bob",
+            "--user.address.street", "X",
+            "--user.address.zip", "1",
+            "--user.secondary.street", "Y",
+            "--user.secondary.zip", "2",
         ],
     )
     assert result.exit_code == 0, result.stdout
@@ -296,22 +322,20 @@ def test_nested_body_optional_model_can_be_supplied(runner, nested_cli):
 def test_deeply_nested_body_flattened(runner):
     """3-level nesting: User -> Profile -> Settings -> theme."""
     cli = FastAPICLI(_build_deep_app(), label="deep")
-
-    # check dotted flags exist at all depths
     post = next(r for r in cli.routes if r.group == "post")
     names = {p.name for p in post.params}
-    assert "profile_nickname" in names
-    assert "profile_settings_theme" in names
-    assert "profile_settings_lang" in names
+    assert "user_profile_nickname" in names
+    assert "user_profile_settings_theme" in names
+    assert "user_profile_settings_lang" in names
 
     result = runner.invoke(
         cli.typer_app,
         [
             "post", "users-uid", "9",
-            "--name", "Deep",
-            "--profile.nickname", "dee",
-            "--profile.settings.theme", "dark",
-            "--profile.settings.lang", "fr",
+            "--user.name", "Deep",
+            "--user.profile.nickname", "dee",
+            "--user.profile.settings.theme", "dark",
+            "--user.profile.settings.lang", "fr",
         ],
     )
     assert result.exit_code == 0, result.stdout
@@ -321,16 +345,190 @@ def test_deeply_nested_body_flattened(runner):
 
 
 def test_same_url_get_vs_put_both_run(runner, nested_cli):
-    """GET and PUT share the path but dispatch to different handlers."""
     g = runner.invoke(nested_cli.typer_app, ["get", "users-uid", "7", "--detail"])
     assert g.exit_code == 0, g.stdout
     assert _json(g) == {"uid": 7, "detail": True}
 
     p = runner.invoke(
         nested_cli.typer_app,
-        ["put", "users-uid", "7", "--name", "Z", "--address.street", "s", "--address.zip", "z"],
+        ["put", "users-uid", "7", "--user.name", "Z", "--user.address.street", "s", "--user.address.zip", "z"],
     )
     assert p.exit_code == 0, p.stdout
     pj = _json(p)
     assert pj["method"] == "PUT"
     assert pj["user"]["name"] == "Z"
+
+
+# --- Depends() handling ---
+
+def test_depends_route_is_skipped_with_warning():
+    """Routes with Depends() should be skipped, not crash at invocation."""
+    import warnings
+    from fastapi import Depends
+
+    def get_db():
+        return {"db": "connected"}
+
+    a = _FA(title="DependsApp")
+
+    @a.get("/items/{item_id}")
+    async def get_item(item_id: int, db=Depends(get_db)):
+        return {"item_id": item_id, "db": db}
+
+    with warnings.catch_warnings(record=True) as w:
+        warnings.simplefilter("always")
+        cli = FastAPICLI(a, label="dep")
+    assert any("Depends" in str(wi.message) for wi in w)
+    assert len(cli.routes) == 0  # the route was skipped
+
+
+# --- enum body fields ---
+
+from enum import Enum
+
+class _Color(str, Enum):
+    red = "red"
+    green = "green"
+    blue = "blue"
+
+class _Paint(_BM):
+    name: str
+    color: _Color
+
+
+def test_enum_body_field(runner):
+    """Enum fields in body models should be coercible from string."""
+    a = _FA()
+    @a.post("/paints/{pid}")
+    async def create_paint(pid: int, paint: _Paint):
+        return {"pid": pid, "paint": paint.model_dump()}
+
+    cli = FastAPICLI(a, label="enum")
+    result = runner.invoke(
+        cli.typer_app,
+        ["post", "paints-pid", "1", "--paint.name", "Sky", "--paint.color", "blue"],
+    )
+    assert result.exit_code == 0, result.stdout
+    out = _json(result)
+    assert out["paint"]["color"] == "blue"
+
+
+# --- union types beyond T | None ---
+
+class _Metric(_BM):
+    key: str
+    value: str | int
+
+
+def test_union_body_field(runner):
+    """Union (str | int) fields should be coerced by pydantic.
+
+    Note: Typer passes CLI args as strings, so pydantic validates the
+    string against the union. ``str | int`` will match ``str`` first (the
+    raw string "42"), so the value stays a string. This is a known
+    limitation of CLI-based union handling — the user can pass JSON via
+    a list[BaseModel] flag if they need exact type control.
+    """
+    a = _FA()
+    @a.post("/metrics/{mid}")
+    async def add_metric(mid: int, metric: _Metric):
+        return {"mid": mid, "metric": metric.model_dump(mode="json")}
+
+    cli = FastAPICLI(a, label="union")
+    result = runner.invoke(
+        cli.typer_app,
+        ["post", "metrics-mid", "1", "--metric.key", "cpu", "--metric.value", "42"],
+    )
+    assert result.exit_code == 0, result.stdout
+    out = _json(result)
+    # str | int validates the raw "42" string as str (first match)
+    assert out["metric"]["value"] == "42"
+
+    result = runner.invoke(
+        cli.typer_app,
+        ["post", "metrics-mid", "1", "--metric.key", "host", "--metric.value", "srv1"],
+    )
+    assert result.exit_code == 0, result.stdout
+    out = _json(result)
+    assert out["metric"]["value"] == "srv1"
+
+
+# --- routes with no parameters ---
+
+def test_no_param_route(runner):
+    """A route with no params (path/query/body) should still work."""
+    a = _FA()
+    @a.get("/health")
+    async def health():
+        return {"status": "ok"}
+
+    cli = FastAPICLI(a, label="health")
+    result = runner.invoke(cli.typer_app, ["get", "health"])
+    assert result.exit_code == 0, result.stdout
+    assert _json(result) == {"status": "ok"}
+
+
+# --- body model field name collisions ---
+
+class _Author(_BM):
+    name: str
+
+class _Book(_BM):
+    name: str
+
+
+def test_body_model_field_name_collisions(runner):
+    """Two body models with same-named fields should get distinct prefixed flags."""
+    a = _FA()
+    @a.post("/authors/{aid}/books/{bid}")
+    async def create(aid: int, bid: int, author: _Author, book: _Book):
+        return {"aid": aid, "bid": bid, "author": author.model_dump(), "book": book.model_dump()}
+
+    cli = FastAPICLI(a, label="collision")
+    post = next(r for r in cli.routes if r.group == "post")
+    flags = {p.cli_name for p in post.params if p.kind == ParamKind.BODY_FIELD}
+    assert "author.name" in flags
+    assert "book.name" in flags
+    assert "author.name" != "book.name"  # no collision
+
+    result = runner.invoke(
+        cli.typer_app,
+        ["post", "authors-aid-books-bid", "1", "2", "--author.name", "Alice", "--book.name", "Go"],
+    )
+    assert result.exit_code == 0, result.stdout
+    out = _json(result)
+    assert out["author"]["name"] == "Alice"
+    assert out["book"]["name"] == "Go"
+
+
+# --- flag uniqueness validation ---
+
+def test_flag_uniqueness_collision_raises():
+    """If two flags would collide, resolve should raise ValueError."""
+    from fastapi_isomorphic.resolver import _check_uniqueness
+    from fastapi_isomorphic.models import Param, ParamKind
+
+    params = [
+        Param(name="a", cli_name="x", kind=ParamKind.QUERY, annotation=str, required=False),
+        Param(name="b", cli_name="x", kind=ParamKind.QUERY, annotation=str, required=False),
+    ]
+    with pytest.raises(ValueError, match="CLI flag collision"):
+        _check_uniqueness(params, "/test")
+
+
+# --- multi-method api_route ---
+
+def test_multi_method_api_route_warns():
+    """@app.api_route with multiple methods should warn but still resolve."""
+    import warnings
+    a = _FA()
+    @a.api_route("/multi", methods=["GET", "POST"])
+    async def multi():
+        return {"ok": True}
+
+    with warnings.catch_warnings(record=True) as w:
+        warnings.simplefilter("always")
+        cli = FastAPICLI(a, label="multi")
+    assert any("multiple methods" in str(wi.message) for wi in w)
+    assert len(cli.routes) == 1
+    assert cli.routes[0].group == "get"  # alphabetically first

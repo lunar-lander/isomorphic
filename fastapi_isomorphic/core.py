@@ -18,20 +18,61 @@ def _load_app(import_path: str) -> Tuple[FastAPI, str]:
 
     The label is the app attribute name (or the module's basename) used as
     the CLI's display name and command-group prefix.
+
+    Raises ``ValueError`` with a helpful message for malformed inputs, and
+    ``ModuleNotFoundError`` / ``AttributeError`` propagate naturally.
     """
+    if not import_path or not import_path.strip():
+        raise ValueError(
+            "Import path must not be empty. Expected 'module.sub:app_attr' or 'module.sub'."
+        )
     if ":" in import_path:
-        module_name, attr = import_path.split(":", 1)
+        parts = import_path.split(":", 1)
+        module_name, attr = parts[0], parts[1]
+        if not module_name:
+            raise ValueError(
+                f"Malformed import path {import_path!r}: module name before ':' is empty. "
+                f"Expected 'module.sub:app_attr'."
+            )
+        if not attr:
+            raise ValueError(
+                f"Malformed import path {import_path!r}: attribute after ':' is empty. "
+                f"Expected 'module.sub:app_attr'."
+            )
+        if ":" in attr:
+            raise ValueError(
+                f"Malformed import path {import_path!r}: multiple ':' found. "
+                f"Expected 'module.sub:app_attr' with exactly one ':'."
+            )
     else:
         module_name, attr = import_path, "app"
-    module = importlib.import_module(module_name)
-    app_obj = getattr(module, attr)
+
+    try:
+        module = importlib.import_module(module_name)
+    except ModuleNotFoundError as e:
+        raise ModuleNotFoundError(
+            f"Could not import module {module_name!r}: {e}. "
+            f"Ensure the module is installed or on PYTHONPATH."
+        ) from e
+
+    try:
+        app_obj = getattr(module, attr)
+    except AttributeError:
+        raise AttributeError(
+            f"Module {module_name!r} has no attribute {attr!r}. "
+            f"Available attributes: {[a for a in dir(module) if not a.startswith('_')][:20]}..."
+        ) from None
+
     if not isinstance(app_obj, FastAPI):
-        # allow a factory function that returns a FastAPI
         if callable(app_obj):
             app_obj = app_obj()
         if not isinstance(app_obj, FastAPI):
-            raise TypeError(f"{import_path} did not resolve to a FastAPI instance")
-    label = attr or module_name.rsplit(".", 1)[-1]
+            raise TypeError(
+                f"{import_path!r} resolved to {type(app_obj).__name__}, not a FastAPI instance. "
+                f"Pass 'module:app_attr' where app_attr is a FastAPI app or a zero-arg factory."
+            )
+
+    label = attr if attr != "app" else module_name.rsplit(".", 1)[-1]
     return app_obj, label
 
 

@@ -4,18 +4,16 @@ from __future__ import annotations
 import inspect
 import re
 import typing
+import warnings
 from typing import Any, List, Optional
 
 from fastapi import FastAPI
 from fastapi.routing import APIRoute
 from pydantic import BaseModel
+from pydantic_core import PydanticUndefined
 
 from .models import Param, ParamKind, ResolvedRoute
-
-_SENTINELS = (
-    inspect.Parameter.empty,
-    inspect._empty,  # type: ignore[attr-defined]
-)
+from .utils import is_list, list_inner, unwrap_optional
 
 
 def _snake(s: str) -> str:
@@ -24,10 +22,8 @@ def _snake(s: str) -> str:
     ``item_id`` -> ``item-id``; ``x-token`` -> ``x-token``; ``Item`` -> ``item``.
     """
     s = s.strip()
-    # already-kebab (http header style) stays as-is once lowercased
     if "-" in s:
         return s.lower()
-    # camelCase / PascalCase -> snake
     s = re.sub(r"(?<=[a-z0-9])([A-Z])", r"_\1", s)
     s = re.sub(r"_+", "_", s)
     return s.lower().replace("_", "-")
@@ -51,24 +47,11 @@ def _command_name(path: str) -> str:
     return "-".join(parts)
 
 
-def _is_list(tp: Any) -> bool:
-    origin = typing.get_origin(tp)
-    return origin in (list, List, typing.List)  # type: ignore[comparison-overlap]
-
-
-def _list_inner(tp: Any) -> Any:
-    args = typing.get_args(tp)
-    return args[0] if args else str
-
-
-def _unwrap_optional(tp: Any) -> Any:
-    """``str | None`` -> ``str`` (None-ness handled via ``required`` flag)."""
-    origin = typing.get_origin(tp)
-    if origin in (typing.Union, getattr(__import__("typing"), "UnionType", None)):
-        args = [a for a in typing.get_args(tp) if a is not type(None)]
-        if len(args) == 1:
-            return args[0]
-    return tp
+def cli_prefix(prefix: str) -> str:
+    """Convert a dotted python path to a dotted CLI path (kebab per segment)."""
+    if not prefix:
+        return ""
+    return ".".join(_snake(seg) for seg in prefix.split("."))
 
 
 def _flatten_model(
@@ -89,32 +72,31 @@ def _flatten_model(
     model is ``T | None``, all its sub-fields become CLI-optional (the user
     can omit the entire sub-tree) and the rebuilder leaves the key absent so
     pydantic applies the ``None`` default.
-    """
-    from pydantic_core import PydanticUndefined
 
+    The ``prefix`` is the endpoint kwarg name (e.g. ``item``) so that two
+    body models with same-named fields (e.g. ``item.name`` and
+    ``filter.name``) don't collide.
+    """
     for fname, finfo in model.model_fields.items():
-        annotation = _unwrap_optional(finfo.annotation)
-        is_list = _is_list(annotation)
-        inner = _list_inner(annotation) if is_list else annotation
+        annotation = unwrap_optional(finfo.annotation)
+        lst = is_list(annotation)
+        inner = list_inner(annotation) if lst else annotation
         default = finfo.get_default()
         if default is PydanticUndefined or default is inspect.Parameter.empty:
             default = None
         field_required = finfo.is_required()
-        # wire key: prefer alias (the JSON key the API accepts)
         alias = finfo.alias or finfo.serialization_alias or finfo.validation_alias
         wire_key = alias if alias and alias != fname else fname
-        # dotted python path (for raw dict key) — dots for human readability
+        # prefix every body field with the model kwarg name to avoid collisions
+        # between multiple body models that share field names
         dotted = f"{prefix}.{fname}" if prefix else fname
-        # python-safe name (underscores) for inspect.Parameter
         py_name = dotted.replace(".", "_")
-        # cli name: use the alias (kebab-cased) if present, else field name
         cli_source = alias if alias and alias != fname else fname
         cli_segment = _snake(cli_source)
         cli_dotted = f"{cli_prefix(prefix)}.{cli_segment}" if prefix else cli_segment
         wire_tuple = wire_prefix + (wire_key,)
 
-        if is_list and isinstance(inner, type) and issubclass(inner, BaseModel):
-            # list[BaseModel] -> single JSON flag, don't recurse
+        if lst and isinstance(inner, type) and issubclass(inner, BaseModel):
             out.append(
                 Param(
                     name=py_name,
@@ -131,7 +113,6 @@ def _flatten_model(
             continue
 
         if isinstance(inner, type) and issubclass(inner, BaseModel):
-            # nested BaseModel -> recurse with deeper prefix
             _flatten_model(
                 inner,
                 endpoint_kwarg,
@@ -142,31 +123,57 @@ def _flatten_model(
             )
             continue
 
-        # scalar field or list[scalar]
         out.append(
             Param(
                 name=py_name,
                 cli_name=cli_dotted,
                 kind=ParamKind.BODY_FIELD,
-                annotation=inner if not is_list else List[inner],  # type: ignore[valid-type]
+                annotation=inner if not lst else List[inner],  # type: ignore[valid-type]
                 required=field_required and not optional_parent,
                 default=default,
                 model_name=endpoint_kwarg,
-                is_list=is_list,
+                is_list=lst,
                 wire_path=wire_tuple,
             )
         )
 
 
-def cli_prefix(prefix: str) -> str:
-    """Convert a dotted python path to a dotted CLI path (kebab per segment)."""
-    if not prefix:
-        return ""
-    return ".".join(_snake(seg) for seg in prefix.split("."))
+def _check_uniqueness(params: List[Param], path: str) -> None:
+    """Raise if two params share the same ``cli_name`` (silent data loss)."""
+    seen: dict[str, str] = {}
+    for p in params:
+        if p.kind == ParamKind.PATH:
+            continue  # positional, no flag
+        if p.cli_name in seen:
+            raise ValueError(
+                f"CLI flag collision on route {path}: --{p.cli_name} maps to "
+                f"both {seen[p.cli_name]} and {p.name}. "
+                f"Use distinct field/alias names or reduce body model overlap."
+            )
+        seen[p.cli_name] = p.name
 
 
-def resolve_route(route: APIRoute) -> ResolvedRoute:
+def _has_unresolvable_dependencies(route: APIRoute) -> bool:
+    """True if the endpoint has Depends() params we can't satisfy via CLI.
+
+    FastAPI's ``dependant.dependencies`` are sub-dependencies. Any endpoint
+    param that comes from ``Depends(...)`` (rather than path/query/header/
+    cookie/body) would receive ``None`` when called as a raw function,
+    causing a TypeError. We detect this by comparing the endpoint's actual
+    signature params against the resolvable param sets.
+    """
+    d = route.dependant
+    # FastAPI stashes special injected params (request, response, etc.) in
+    # named attributes; anything in dependant.dependencies is a Depends().
+    return bool(d.dependencies)
+
+
+def resolve_route(route: APIRoute) -> Optional[ResolvedRoute]:
     """Turn a single :class:`fastapi.routing.APIRoute` into a ResolvedRoute.
+
+    Returns ``None`` (with a warning) if the route has ``Depends()``
+    sub-dependencies that cannot be resolved in a CLI context, since calling
+    the raw endpoint would crash with a missing-argument TypeError.
 
     The endpoint function's signature is the source of truth for *types*,
     while the route's ``dependent`` partitions parameters by origin
@@ -176,8 +183,22 @@ def resolve_route(route: APIRoute) -> ResolvedRoute:
     """
     endpoint = route.endpoint
     sig = inspect.signature(endpoint)
-    hints = typing.get_type_hints(endpoint, include_extras=True)
+    try:
+        hints = typing.get_type_hints(endpoint, include_extras=True)
+    except NameError:
+        # forward refs that can't be resolved — fall back to raw annotations
+        hints = {name: param.annotation for name, param in sig.parameters.items() if param.annotation is not inspect.Parameter.empty}
     dependant = route.dependant
+
+    # Detect Depends() — can't call raw endpoint
+    if _has_unresolvable_dependencies(route):
+        warnings.warn(
+            f"Skipping route {route.methods} {route.path}: endpoint uses "
+            f"Depends() which cannot be resolved in a CLI context. "
+            f"Call this route via HTTP instead.",
+            stacklevel=2,
+        )
+        return None
 
     params: List[Param] = []
     body_models: List[str] = []
@@ -186,49 +207,41 @@ def resolve_route(route: APIRoute) -> ResolvedRoute:
         pname = p.name
         sp = sig.parameters.get(pname)
         annotation = hints.get(pname, sp.annotation if sp else Any)
-        annotation = _unwrap_optional(annotation)
-        is_list = _is_list(annotation)
-        inner = _list_inner(annotation) if is_list else annotation
-        # actual default lives on the field_info (Query(10)/Header(None))
+        annotation = unwrap_optional(annotation)
+        lst = is_list(annotation)
+        inner = list_inner(annotation) if lst else annotation
         fi_default = getattr(p.field_info, "default", None)
-        from pydantic_core import PydanticUndefined
         if fi_default is PydanticUndefined or fi_default is inspect.Parameter.empty:
             fi_default = None
             required = True
         else:
-            # an explicit default (incl. None) means the param is optional
             required = False
         return Param(
             name=pname,
             cli_name=_snake(pname),
             kind=None,  # set by caller
-            annotation=inner if is_list else annotation,
+            annotation=inner if lst else annotation,
             required=required,
             default=fi_default,
-            is_list=is_list,
+            is_list=lst,
         )
 
-    # path
     for p in dependant.path_params:
         bp = _base(p)
         bp.kind = ParamKind.PATH
         bp.required = True
         params.append(bp)
-    # query
     for p in dependant.query_params:
         bp = _base(p)
         bp.kind = ParamKind.QUERY
         params.append(bp)
-    # header (Header() always has alias with '-' substitution; use alias for cli_name)
     for p in dependant.header_params:
         bp = _base(p)
         bp.kind = ParamKind.HEADER
-        # FastAPI Header alias is the on-the-wire name (e.g. 'x-token'); prefer it
         alias = getattr(p, "alias", None) or getattr(p.field_info, "alias", None)
         if alias and alias != p.name:
             bp.cli_name = alias.lower()
         params.append(bp)
-    # cookie
     for p in dependant.cookie_params:
         bp = _base(p)
         bp.kind = ParamKind.COOKIE
@@ -236,35 +249,44 @@ def resolve_route(route: APIRoute) -> ResolvedRoute:
         if alias and alias != p.name:
             bp.cli_name = alias.lower()
         params.append(bp)
-    # body -> flatten each model
     for p in dependant.body_params:
         pname = p.name
         annotation = hints.get(pname, sig.parameters.get(pname).annotation if pname in sig.parameters else Any)
-        annotation = _unwrap_optional(annotation)
+        annotation = unwrap_optional(annotation)
         if isinstance(annotation, type) and issubclass(annotation, BaseModel):
             body_models.append(pname)
-            _flatten_model(annotation, pname, "", (), params, optional_parent=False)
+            _flatten_model(annotation, pname, pname, (pname,), params, optional_parent=False)
         else:
-            # non-pydantic body (raw scalar/list) -> single BODY_FIELD param
-            is_list = _is_list(annotation)
-            inner = _list_inner(annotation) if is_list else annotation
+            lst = is_list(annotation)
+            inner = list_inner(annotation) if lst else annotation
             params.append(
                 Param(
                     name=pname,
                     cli_name=_snake(pname),
                     kind=ParamKind.BODY_FIELD,
-                    annotation=inner if is_list else annotation,
+                    annotation=inner if lst else annotation,
                     required=True,
                     default=None,
                     model_name=pname,
-                    is_list=is_list,
+                    is_list=lst,
+                    wire_path=(pname,),
                 )
             )
 
-    method = sorted(route.methods)[0].lower() if route.methods else "any"
-    group = method
-    cmd = _command_name(route.path)
+    _check_uniqueness(params, route.path)
 
+    # Use the first method alphabetically as the group; warn if multiple
+    methods_sorted = sorted(route.methods) if route.methods else []
+    method = methods_sorted[0].lower() if methods_sorted else "any"
+    if len(methods_sorted) > 1:
+        warnings.warn(
+            f"Route {route.path} has multiple methods {methods_sorted}; "
+            f"generating a single command under group '{method}'. "
+            f"Use @app.api_route with caution — the command may be ambiguous.",
+            stacklevel=2,
+        )
+
+    cmd = _command_name(route.path)
     doc = (endpoint.__doc__ or "").strip()
     summary = doc.splitlines()[0] if doc else f"{method.upper()} {route.path}"
     description = doc if doc else f"Invoke {method.upper()} {route.path} directly in-process."
@@ -274,7 +296,7 @@ def resolve_route(route: APIRoute) -> ResolvedRoute:
         path=route.path,
         methods=set(route.methods),
         command_name=cmd,
-        group=group,
+        group=method,
         summary=summary,
         description=description,
         params=params,
@@ -283,5 +305,14 @@ def resolve_route(route: APIRoute) -> ResolvedRoute:
 
 
 def resolve_app(app: FastAPI) -> List[ResolvedRoute]:
-    """Resolve every APIRoute on an app, ignoring mounts/websockets."""
-    return [resolve_route(r) for r in app.routes if isinstance(r, APIRoute)]
+    """Resolve every APIRoute on an app, ignoring mounts/websockets.
+
+    Routes with unresolvable ``Depends()`` are skipped with a warning.
+    """
+    resolved: List[ResolvedRoute] = []
+    for r in app.routes:
+        if isinstance(r, APIRoute):
+            rr = resolve_route(r)
+            if rr is not None:
+                resolved.append(rr)
+    return resolved
