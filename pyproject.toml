@@ -1,0 +1,22 @@
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "fastapi-isomorphic"
+version = "0.1.0"
+description = "Turn any FastAPI app into an isomorphic CLI with flattened command-line params."
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = [
+    "fastapi>=0.110",
+    "typer>=0.9",
+    "pydantic>=2.0",
+]
+
+[project.scripts]
+fastapi-isomorphic = "fastapi_isomorphic.core:main"
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["fastapi_isomorphic*"]
