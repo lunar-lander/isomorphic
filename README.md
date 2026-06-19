@@ -58,17 +58,22 @@ fastapi-isomorphic my_package.my_module:app get items-item-id 7 --limit 5
 | Header param `x_token` (alias `x-token`) | `--x-token`                          |
 | Cookie param                  | `--cookie-name`                                        |
 | Body `item: Item` (pydantic)  | flattened to `--name`, `--price-alias`, `--tags` ...   |
-| Body `item: Item` with nested model | nested field validated as JSON via `--nested`  |
+| Body `item: Item` with nested model | recursively flattened to dotted flags: `--item.address.street`, `--item.address.zip` |
 
-Body models are *flattened*: each pydantic field becomes its own flag, so
-`POST /items/{item_id}` with body `Item` is invoked as:
+Body models are **recursively flattened** with `.` as the nesting delimiter.
+Each pydantic field — at any depth — becomes its own dotted flag, so
+`POST /users/{uid}` with body `User{name, profile: Profile{nickname, settings: Settings{theme, lang}}}`
+is invoked as:
 
 ```bash
-post items-item-id 3 --name "Widget" --price-alias 9.99 --tags a --tags b
+post users-uid 3 --name Ada --profile.nickname dee --profile.settings.theme dark --profile.settings.lang fr
 ```
 
 Repeated `--tags` produce a list. Optional fields can be omitted; pydantic
-fills in their defaults. Nested BaseModel fields accept a JSON string.
+fills in their defaults. Optional nested models (`Address | None`) whose
+sub-fields are all omitted resolve to `None`. `list[BaseModel]` fields are
+kept as a single JSON-accepting flag (e.g. `--items '[{...}]'`) since a list
+of complex objects cannot be meaningfully flattened into scalar flags.
 
 ## Output
 

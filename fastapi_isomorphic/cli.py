@@ -64,7 +64,12 @@ def _make_command(route: ResolvedRoute, app_label: str) -> Callable[..., Any]:
                 inspect.Parameter(p.name, inspect.Parameter.POSITIONAL_OR_KEYWORD, default=decl, annotation=annotation)
             )
         else:
-            default_val = ... if p.required else p.default
+            # body fields: always default to None on the CLI side so the
+            # rebuilder can omit them and let pydantic apply model defaults.
+            if p.kind == ParamKind.BODY_FIELD:
+                default_val = ... if p.required else None
+            else:
+                default_val = ... if p.required else p.default
             help_text = f"{p.kind.value}: {p.name}" + (
                 f" (body field of {p.model_name})" if p.model_name else ""
             )

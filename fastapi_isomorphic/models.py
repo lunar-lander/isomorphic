@@ -48,7 +48,7 @@ class Param:
     default: Any = None
     model_name: Optional[str] = None
     is_list: bool = False
-    wire_name: Optional[str] = None  # JSON key the API/pydantic accepts (alias or field name)
+    wire_path: tuple = ()  # tuple of dict keys (aliases/field-names) to rebuild nested structure
 
 
 @dataclass

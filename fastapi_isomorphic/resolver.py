@@ -71,62 +71,98 @@ def _unwrap_optional(tp: Any) -> Any:
     return tp
 
 
-def _flatten_model(model: type[BaseModel], endpoint_kwarg: str, out: List[Param]) -> None:
-    """Emit one :class:`Param` (kind BODY_FIELD) per leaf field of a body model.
+def _flatten_model(
+    model: type[BaseModel],
+    endpoint_kwarg: str,
+    prefix: str,
+    wire_prefix: tuple,
+    out: List[Param],
+    optional_parent: bool,
+) -> None:
+    """Emit one :class:`Param` per leaf field of a body model, recursing into
+    nested BaseModels with dotted names (``address.street``).
 
-    Nested BaseModel fields recurse using dotted model names so callers can
-    rebuild nested structures. List[BaseModel] becomes a repeatable flag whose
-    value is JSON per element. Enum / scalar list fields keep their scalar
-    type with is_list=True so Typer collects repeats.
+    Nested ``list[BaseModel]`` is kept as a single JSON-accepting flag since
+    a list of complex objects cannot be meaningfully flattened into scalar
+    CLI flags. Scalar lists (``list[str]``) keep their repeatable flag
+    behavior. ``optional_parent`` propagates optionality: when a nested
+    model is ``T | None``, all its sub-fields become CLI-optional (the user
+    can omit the entire sub-tree) and the rebuilder leaves the key absent so
+    pydantic applies the ``None`` default.
     """
+    from pydantic_core import PydanticUndefined
+
     for fname, finfo in model.model_fields.items():
-        annotation = finfo.annotation
-        annotation = _unwrap_optional(annotation)
+        annotation = _unwrap_optional(finfo.annotation)
         is_list = _is_list(annotation)
         inner = _list_inner(annotation) if is_list else annotation
         default = finfo.get_default()
-        from pydantic_core import PydanticUndefined
-        required = finfo.is_required() and default in (None, PydanticUndefined, inspect.Parameter.empty)
-        # treat a pydantic-undefined default as "no default" -> None
         if default is PydanticUndefined or default is inspect.Parameter.empty:
             default = None
-        # mirror the API: prefer the field's wire alias (kebab-cased) so the
-        # CLI flag matches the JSON key the endpoint actually accepts.
+        field_required = finfo.is_required()
+        # wire key: prefer alias (the JSON key the API accepts)
         alias = finfo.alias or finfo.serialization_alias or finfo.validation_alias
-        cli_name = _snake(alias) if alias and alias != fname else _snake(fname)
-        wire_name = alias if alias and alias != fname else fname
-        # nested model
-        if isinstance(inner, type) and issubclass(inner, BaseModel):
-            # keep the scalar shape (the user passes JSON for nested) but tag the
-            # model_name so the rebuilder can validate via the nested model.
+        wire_key = alias if alias and alias != fname else fname
+        # dotted python path (for raw dict key) — dots for human readability
+        dotted = f"{prefix}.{fname}" if prefix else fname
+        # python-safe name (underscores) for inspect.Parameter
+        py_name = dotted.replace(".", "_")
+        # cli name: use the alias (kebab-cased) if present, else field name
+        cli_source = alias if alias and alias != fname else fname
+        cli_segment = _snake(cli_source)
+        cli_dotted = f"{cli_prefix(prefix)}.{cli_segment}" if prefix else cli_segment
+        wire_tuple = wire_prefix + (wire_key,)
+
+        if is_list and isinstance(inner, type) and issubclass(inner, BaseModel):
+            # list[BaseModel] -> single JSON flag, don't recurse
             out.append(
                 Param(
-                    name=fname,
-                    cli_name=cli_name,
+                    name=py_name,
+                    cli_name=cli_dotted,
                     kind=ParamKind.BODY_FIELD,
-                    annotation=inner if not is_list else List[inner],  # type: ignore[valid-type]
-                    required=required,
+                    annotation=List[inner],  # type: ignore[valid-type]
+                    required=field_required and not optional_parent,
                     default=default,
                     model_name=endpoint_kwarg,
-                    is_list=is_list,
-                    wire_name=wire_name,
+                    is_list=True,
+                    wire_path=wire_tuple,
                 )
             )
             continue
-        # plain field
+
+        if isinstance(inner, type) and issubclass(inner, BaseModel):
+            # nested BaseModel -> recurse with deeper prefix
+            _flatten_model(
+                inner,
+                endpoint_kwarg,
+                dotted,
+                wire_tuple,
+                out,
+                optional_parent or not field_required,
+            )
+            continue
+
+        # scalar field or list[scalar]
         out.append(
             Param(
-                name=fname,
-                cli_name=cli_name,
+                name=py_name,
+                cli_name=cli_dotted,
                 kind=ParamKind.BODY_FIELD,
                 annotation=inner if not is_list else List[inner],  # type: ignore[valid-type]
-                required=required,
+                required=field_required and not optional_parent,
                 default=default,
                 model_name=endpoint_kwarg,
                 is_list=is_list,
-                wire_name=wire_name,
+                wire_path=wire_tuple,
             )
         )
+
+
+def cli_prefix(prefix: str) -> str:
+    """Convert a dotted python path to a dotted CLI path (kebab per segment)."""
+    if not prefix:
+        return ""
+    return ".".join(_snake(seg) for seg in prefix.split("."))
 
 
 def resolve_route(route: APIRoute) -> ResolvedRoute:
@@ -207,7 +243,7 @@ def resolve_route(route: APIRoute) -> ResolvedRoute:
         annotation = _unwrap_optional(annotation)
         if isinstance(annotation, type) and issubclass(annotation, BaseModel):
             body_models.append(pname)
-            _flatten_model(annotation, pname, params)
+            _flatten_model(annotation, pname, "", (), params, optional_parent=False)
         else:
             # non-pydantic body (raw scalar/list) -> single BODY_FIELD param
             is_list = _is_list(annotation)

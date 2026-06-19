@@ -2,8 +2,9 @@
 from __future__ import annotations
 
 import inspect
+import json
 import typing
-from typing import Any, Dict, Optional
+from typing import Any, Dict, List, Optional
 
 from pydantic import BaseModel, TypeAdapter
 
@@ -15,59 +16,78 @@ def _coerce(value: Any, annotation: Any) -> Any:
 
     Pydantic's TypeAdapter handles scalars, lists, Optional, nested
     BaseModels and enums uniformly. ``None`` passes through untouched.
+    For BaseModel / list[BaseModel] annotations we first ``json.loads``
+    the string so pydantic receives a dict/list rather than a raw string
+    (it won't auto-parse JSON into a model).
     """
     if value is None:
         return None
     if annotation is inspect.Parameter.empty or annotation is None:
         return value
+    origin = typing.get_origin(annotation)
+    args = typing.get_args(annotation)
+    inner = args[0] if args else None
+    is_model = (
+        isinstance(annotation, type) and issubclass(annotation, BaseModel)
+    ) or (
+        origin in (list, List, typing.List)  # type: ignore[comparison-overlap]
+        and isinstance(inner, type) and issubclass(inner, BaseModel)
+    )
+    if is_model and isinstance(value, str):
+        try:
+            value = json.loads(value)
+        except (json.JSONDecodeError, TypeError):
+            pass  # let pydantic raise a clearer error
     ta = TypeAdapter(annotation)
     return ta.validate_python(value)
+
+
+def _set_nested(d: dict, path: tuple, value: Any) -> None:
+    """Set ``value`` at a dotted/tuple path inside nested dict ``d``."""
+    for key in path[:-1]:
+        d = d.setdefault(key, {})
+    d[path[-1]] = value
 
 
 def rebuild_args(route: ResolvedRoute, raw: Dict[str, Any]) -> Dict[str, Any]:
     """Map flat ``{param_name: raw_value}`` to endpoint kwargs.
 
     Path/query/header/cookie params map 1:1 by name. Body fields are
-    reassembled: all fields tagged with the same ``model_name`` become a
-    single pydantic model instance passed under that kwarg name. A body
-    field that was supplied as ``None`` and is *optional* is dropped so the
-    model's own default applies. Nested-model body fields are validated via
-    the nested model (TypeAdapter coerces a JSON string or dict).
+    reassembled: all fields tagged with the same ``model_name`` are placed
+    into a nested dict (using each field's ``wire_path`` tuple of alias/field
+    keys) and then validated into a single pydantic model instance. Fields
+    the user did not supply (value is ``None``) are omitted so pydantic
+    applies the model's own defaults. Nested optional models whose sub-fields
+    are all omitted simply won't appear in the dict, yielding ``None``.
     """
     kwargs: Dict[str, Any] = {}
-    # collect body fields per model
-    body_buckets: Dict[str, Dict[str, Any]] = {m: {} for m in route.body_models}
+    body_buckets: Dict[str, dict] = {m: {} for m in route.body_models}
 
     for p in route.params:
         v = raw.get(p.name, p.default)
-        # path/query/header/cookie
         if p.kind in (ParamKind.PATH, ParamKind.QUERY, ParamKind.HEADER, ParamKind.COOKIE):
             kwargs[p.name] = _coerce(v, p.annotation)
             continue
-        # body field -> bucket
+        # body field
         if p.model_name is None:
             # raw non-pydantic body
             kwargs[p.name] = _coerce(v, p.annotation)
             continue
-        bucket = body_buckets[p.model_name]
-        # only include the field if user supplied it (key in raw) OR it's required
-        if p.name in raw or p.required:
-            # validate using the wire name (alias) the model accepts
-            key = p.wire_name or p.name
-            bucket[key] = _coerce(v, p.annotation)
+        # skip None values — let pydantic apply defaults
+        if v is None:
+            continue
+        coerced = _coerce(v, p.annotation)
+        _set_nested(body_buckets[p.model_name], p.wire_path, coerced)
 
-    # rebuild each body model
+    # rebuild each body model from its nested dict
     hints = typing.get_type_hints(route.endpoint, include_extras=True)
     for mname in route.body_models:
-        annotation = hints.get(mname, Any)
-        annotation = _unwrap_optional(annotation)
+        annotation = _unwrap_optional(hints.get(mname, Any))
         bucket = body_buckets[mname]
         if isinstance(annotation, type) and issubclass(annotation, BaseModel):
-            # only construct with provided fields; pydantic fills defaults
-            provided = {k: v for k, v in bucket.items() if v is not None or k in raw}
-            kwargs[mname] = annotation.model_validate(provided)
+            kwargs[mname] = annotation.model_validate(bucket)
         else:
-            kwargs[mname] = _coerce(bucket.get("__raw__"), annotation) if bucket else None
+            kwargs[mname] = _coerce(bucket, annotation)
 
     return kwargs
 
